@@ -113,7 +113,7 @@
             done
             validate version example < ${./pkgs/_template/version.json} || fail=1
             test -x ${./pkgs/_template/get-version} || { echo "_template/get-version is not executable" >&2; fail=1; }
-            validate getter example < <(${./pkgs/_template/get-version}) || fail=1
+            validate getter example < <(bash ${./pkgs/_template/get-version}) || fail=1
 
             test "$fail" = 0
             touch $out
