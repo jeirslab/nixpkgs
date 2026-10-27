@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Version getter for tailscale (contract: see pkgs/_template/README.md).
+# Prints one JSON object on stdout, nothing else. Needs: curl, jq. Optional GITHUB_TOKEN.
+set -euo pipefail
+auth=()
+[ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+tag=$(curl -fsSL "${auth[@]}" https://api.github.com/repos/tailscale/tailscale/releases/latest | jq -r .tag_name)
+version=${tag#v}
+[[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "unexpected tag: $tag" >&2; exit 1; }
+jq -cn --arg v "$version" --arg t "$tag" \
+  '{name: "tailscale", version: $v, url: "https://github.com/tailscale/tailscale/archive/refs/tags/\($t).tar.gz"}'

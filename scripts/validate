@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Schema checks for the self-update model. Needs: jq. Reads JSON on stdin.
+#
+#   validate getter NAME < output     the output of pkgs/NAME/get-version
+#   validate version NAME < file      the contents of pkgs/NAME/version.json
+#
+# Exit 0 and no output when valid; exit 1 and the reasons on stderr otherwise.
+#
+# getter schema (exactly these keys, nothing else on stdout):
+#   { "name": "<package name>", "version": "<version>", "url": "<https url>" }
+# version.json schema (keys under "hashes" vary per package, the shape does not):
+#   { "version": "<version>", "hashes": { "<key>": "sha256-..." }, "updated": "YYYY-MM-DD" }
+set -euo pipefail
+
+mode=${1:-}
+name=${2:-}
+[ -n "$mode" ] && [ -n "$name" ] || { echo "usage: validate getter|version NAME < json" >&2; exit 2; }
+input=$(cat)
+
+# One JSON value only (a getter that prints anything else fails here).
+if ! printf '%s' "$input" | jq -e -s 'length == 1 and (.[0] | type) == "object"' > /dev/null 2>&1; then
+  echo "$name: not exactly one JSON object" >&2
+  exit 1
+fi
+
+case $mode in
+  getter)
+    program='
+      def semver: type == "string" and test("^[0-9]+(\\.[0-9]+)*([-+][0-9A-Za-z.+-]+)?$");
+      [ (if (keys | sort) != ["name","url","version"] then "keys must be exactly name, url, version" else empty end),
+        (if .name != $name then "name must be \($name)" else empty end),
+        (if (.version | semver | not) then "version is not a version string" else empty end),
+        (if ((.url // null) | type != "string" or (test("^https://[^ ]+$") | not)) then "url must be an https url" else empty end)
+      ] | .[]'
+    ;;
+  version)
+    program='
+      def semver: type == "string" and test("^[0-9]+(\\.[0-9]+)*([-+][0-9A-Za-z.+-]+)?$");
+      [ (if (keys | sort) != ["hashes","updated","version"] then "keys must be exactly version, hashes, updated" else empty end),
+        (if (.version | semver | not) then "version is not a version string" else empty end),
+        (if ((.updated // null) | type != "string" or (test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$") | not)) then "updated must be YYYY-MM-DD" else empty end),
+        (if ((.hashes // null) | type != "object" or length == 0) then "hashes must be a non-empty object" else
+           (.hashes | to_entries[] | select((.value | type != "string") or (.value | test("^sha256-[A-Za-z0-9+/]{43}=$") | not)) | "hashes.\(.key) is not an sha256 SRI hash")
+         end)
+      ] | .[]'
+    ;;
+  *) echo "unknown mode: $mode" >&2; exit 2 ;;
+esac
+
+errors=$(printf '%s' "$input" | jq -r --arg name "$name" "$program")
+if [ -n "$errors" ]; then
+  printf '%s: %s\n' "$name" "$errors" >&2
+  exit 1
+fi

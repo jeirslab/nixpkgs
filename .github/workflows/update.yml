@@ -3,31 +3,39 @@ on:
   schedule:
     - cron: "17 5 * * *"
   workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
 permissions:
   contents: write
-concurrency: update
+concurrency:
+  group: update-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  update:
+  check:
+    # The model and every package: schema, consistency, build, smoke tests.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
-      - name: Update every package that has an update.sh
+      - name: nix flake check
+        run: nix flake check --print-build-logs
+  update:
+    needs: check
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - name: Update every self-updating package (one commit each, after its build and checks)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
-          for script in pkgs/*/update.sh; do
-            [ -e "$script" ] || continue
-            nix shell --inputs-from . nixpkgs#jq nixpkgs#curl --command "$script"
-          done
-      - name: Build and check
-        run: nix flake check --print-build-logs
-      - name: Commit if changed
-        run: |
-          if git diff --quiet; then echo "nothing to commit"; exit 0; fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pkgs
-          git commit -m "update packages: $(git diff --cached --name-only | tr '\n' ' ')"
-          git push
+          nix shell --inputs-from . nixpkgs#jq nixpkgs#curl nixpkgs#git --command scripts/update --commit
+      - name: Push the commits
+        if: always()
+        run: |
+          git log --oneline origin/main..HEAD
+          git push origin HEAD:main

@@ -1,15 +1,24 @@
-# nixpkgs' tailscale, moved to the release pinned in source.json.
-# source.json is rewritten by ./update.sh (daily, by .github/workflows/update.yml).
+# nixpkgs' tailscale, moved to the release logged in version.json.
+# version.json is rewritten by scripts/update (daily, by .github/workflows/update.yml);
+# get-version finds the latest release. The model: README.md, "Adding a self-updating package".
 { lib, fetchFromGitHub, tailscale }:
 let
-  source = lib.importJSON ./source.json;
+  logged = lib.importJSON ./version.json;
 in
 tailscale.overrideAttrs (old: {
-  inherit (source) version vendorHash;
+  inherit (logged) version;
+  vendorHash = logged.hashes.vendor;
   src = fetchFromGitHub {
     owner = "tailscale";
     repo = "tailscale";
-    tag = "v${source.version}";
-    inherit (source) hash;
+    tag = "v${logged.version}";
+    hash = logged.hashes.src;
+  };
+  passthru = (old.passthru or { }) // {
+    selfUpdate = {
+      getVersion = ./get-version;
+      versionFile = ./version.json;
+      hashes = [ "src" "vendor" ];
+    };
   };
 })

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Example version getter. Replace the body; keep the output contract:
+# no arguments, exactly one JSON object on stdout, exit 0; non-zero on failure,
+# diagnostics on stderr only. Needs: whatever you call (curl, jq are provided).
+set -euo pipefail
+# A real getter asks upstream, e.g. the latest GitHub release:
+#   tag=$(curl -fsSL https://api.github.com/repos/OWNER/REPO/releases/latest | jq -r .tag_name)
+version=1.2.3
+jq -cn --arg v "$version" \
+  '{name: "example", version: $v, url: "https://example.org/example-\($v).tar.gz"}'

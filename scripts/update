@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# The shared updater: keeps every self-updating package current.
+# Needs: nix (flakes), jq, git. The getters bring their own needs (curl, ...).
+#
+#   scripts/update [--package NAME]... [--dry-run] [--commit]
+#
+# For each package that declares passthru.selfUpdate (flake output selfUpdate):
+#   1. run its get-version, validate the output (scripts/validate getter)
+#   2. compare with pkgs/<name>/version.json (also with the version of the built package)
+#   3. if different: write the new version, recompute every hash listed in
+#      selfUpdate.hashes (src by prefetch from the getter's url, the rest from the
+#      fake-hash build's "got:" line), build the package, build checks.<system>.<name>
+#   4. keep the change only if all of that passed; otherwise version.json is restored
+# --dry-run only reports. --commit makes one commit per updated package
+# ("<name>: <old> -> <new>", only version.json), after its checks passed.
+#
+# One line per package on stdout:  [update] <name> <status> <detail>
+#   up-to-date <version> | available <old> -> <new> (dry-run) | updated <old> -> <new> | FAILED <reason>
+# Exit: 0 all packages up to date or updated; 1 at least one FAILED; 2 usage error.
+set -uo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$root"
+dry=0 commit=0 only=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --package) [ $# -ge 2 ] || { echo "--package needs a name" >&2; exit 2; }; only+=("$2"); shift 2 ;;
+    --dry-run) dry=1; shift ;;
+    --commit) commit=1; shift ;;
+    -h|--help) sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+[ "$dry" = 1 ] && [ "$commit" = 1 ] && { echo "--dry-run and --commit exclude each other" >&2; exit 2; }
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+status=0
+
+system=$(nix eval --raw --impure --expr builtins.currentSystem) || { echo "cannot determine system" >&2; exit 1; }
+nix eval --json ".#selfUpdate.$system" > "$work/model.json" 2> "$work/eval.log" \
+  || { cat "$work/eval.log" >&2; echo "cannot evaluate the selfUpdate output" >&2; exit 1; }
+mapfile -t names < <(jq -r 'keys[]' "$work/model.json")
+if [ ${#only[@]} -gt 0 ]; then
+  for n in "${only[@]}"; do
+    jq -e --arg n "$n" 'has($n)' "$work/model.json" > /dev/null || { echo "not a self-updating package: $n" >&2; exit 2; }
+  done
+  names=("${only[@]}")
+fi
+
+report() { printf '[update] %s %s\n' "$1" "$2"; }
+
+# fake hash, distinct per key, so the build's "specified:" line says which key failed
+fake_for() {
+  nix hash convert --hash-algo sha256 --from base16 --to sri "$(printf '%s' "$1" | sha256sum | cut -d' ' -f1)"
+}
+
+# set_hash FILE KEY VALUE
+set_hash() {
+  jq --arg k "$2" --arg v "$3" '.hashes[$k] = $v' "$1" > "$1.new" && mv "$1.new" "$1"
+}
+
+# Recompute every listed hash of NAME in FILE; URL is the getter's url.
+resolve_hashes() {
+  local name=$1 file=$2 url=$3 key n log got spec k cur
+  mapfile -t keys < <(jq -r --arg n "$name" '.[$n].hashes[]' "$work/model.json")
+  for key in "${keys[@]}"; do
+    if [ "$key" = src ] && got=$(nix store prefetch-file --unpack --json "$url" 2> "$work/prefetch.log" | jq -re .hash); then
+      set_hash "$file" "$key" "$got"
+    else
+      set_hash "$file" "$key" "$(fake_for "$key")"
+    fi
+  done
+  # Each failed build names one wrong hash: "specified: X ... got: Y".
+  log=$work/build.log
+  for n in $(seq 0 ${#keys[@]}); do
+    if nix build ".#$name" --no-link --print-build-logs > /dev/null 2> "$log"; then
+      return 0
+    fi
+    spec=$(sed -n 's/^ *specified: *\(sha256-[A-Za-z0-9+\/=]*\).*/\1/p' "$log" | tail -n1)
+    got=$(sed -n 's/^ *got: *\(sha256-[A-Za-z0-9+\/=]*\).*/\1/p' "$log" | tail -n1)
+    [ -n "$spec" ] && [ -n "$got" ] || { tail -n 20 "$log" >&2; return 1; }
+    k=""
+    for key in "${keys[@]}"; do
+      cur=$(jq -r --arg k "$key" '.hashes[$k]' "$file")
+      [ "$cur" = "$spec" ] && k=$key
+    done
+    [ -n "$k" ] || { echo "hash mismatch not attributable to a listed hash (specified $spec)" >&2; return 1; }
+    set_hash "$file" "$k" "$got"
+  done
+  echo "hashes did not settle" >&2
+  return 1
+}
+
+update_one() {
+  local name=$1 vf gv old logged out new url
+  vf=$(jq -r --arg n "$name" '.[$n].versionFile' "$work/model.json")
+  gv=$(jq -r --arg n "$name" '.[$n].getVersion' "$work/model.json")
+  [ -x "$gv" ] || { report "$name" "FAILED $gv is not executable"; return 1; }
+  [ -f "$vf" ] || { report "$name" "FAILED $vf is missing"; return 1; }
+  bash scripts/validate version "$name" < "$vf" 2> "$work/err" || { report "$name" "FAILED version.json invalid: $(tr '\n' ' ' < "$work/err")"; return 1; }
+  logged=$(jq -r .version "$vf")
+  old=$(jq -r --arg n "$name" '.[$n].version' "$work/model.json")
+  [ "$logged" = "$old" ] || { report "$name" "FAILED version.json says $logged, the package is $old"; return 1; }
+
+  out=$work/getter.out
+  if ! "./$gv" > "$out" 2> "$work/getter.err"; then
+    report "$name" "FAILED get-version exited non-zero: $(tail -n 3 "$work/getter.err" | tr '\n' ' ')"; return 1
+  fi
+  bash scripts/validate getter "$name" < "$out" 2> "$work/err" || { report "$name" "FAILED get-version output invalid: $(tr '\n' ' ' < "$work/err")"; return 1; }
+  new=$(jq -r .version "$out")
+  url=$(jq -r .url "$out")
+
+  if [ "$new" = "$logged" ]; then report "$name" "up-to-date $logged"; return 0; fi
+  if [ "$dry" = 1 ]; then report "$name" "available $logged -> $new (dry-run)"; return 0; fi
+
+  cp "$vf" "$work/$name.version.json.bak"
+  restore() { cp "$work/$name.version.json.bak" "$vf"; }
+  jq --arg v "$new" --arg d "$(date -u +%F)" '.version = $v | .updated = $d' "$vf" > "$vf.new" && mv "$vf.new" "$vf"
+  if ! resolve_hashes "$name" "$vf" "$url" 2> "$work/resolve.err"; then
+    report "$name" "FAILED $logged -> $new: build/hashes: $(tail -n 5 "$work/resolve.err" | tr '\n' ' ')"; restore; return 1
+  fi
+  bash scripts/validate version "$name" < "$vf" 2> "$work/err" || { report "$name" "FAILED new version.json invalid: $(tr '\n' ' ' < "$work/err")"; restore; return 1; }
+  if nix eval --raw ".#checks.$system.$name.name" > /dev/null 2>&1; then
+    nix build ".#checks.$system.$name" --no-link --print-build-logs > /dev/null 2> "$work/check.log" \
+      || { report "$name" "FAILED $logged -> $new: check: $(tail -n 5 "$work/check.log" | tr '\n' ' ')"; restore; return 1; }
+  fi
+  if [ "$commit" = 1 ]; then
+    git add -- "$vf" && git commit -q -m "$name: $logged -> $new" -- "$vf" \
+      || { report "$name" "FAILED $logged -> $new: git commit"; restore; return 1; }
+  fi
+  report "$name" "updated $logged -> $new"
+}
+
+for name in "${names[@]}"; do
+  update_one "$name" || status=1
+done
+exit $status
