@@ -1,0 +1,33 @@
+name: update
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency: update
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@ # v7.0.1
+      - uses: DeterminateSystems/nix-installer-action@ # v23
+      - name: Update every package that has an update.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for script in pkgs/*/update.sh; do
+            [ -e "$script" ] || continue
+            nix shell --inputs-from . nixpkgs#jq nixpkgs#curl --command "$script"
+          done
+      - name: Build and check
+        run: nix flake check --print-build-logs
+      - name: Commit if changed
+        run: |
+          if git diff --quiet; then echo "nothing to commit"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pkgs
+          git commit -m "update packages: $(git diff --cached --name-only | tr '\n' ' ')"
+          git push
